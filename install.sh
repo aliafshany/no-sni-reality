@@ -504,13 +504,22 @@ esac
 
 # --------------------------------------------------------------- output
 
-LINK="vless://$UUID@$SERVER_IP:$XRAY_PORT?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&pbk=$PUBLIC_KEY&fp=chrome&sni=$SERVER_IP&sid=&spx=#$TAG"
+# Read the shortId back out of the config that was just written rather than
+# assuming it is empty: a rerun preserves whatever the operator set by hand, and
+# a link carrying the wrong sid does not connect.
+EFFECTIVE_SID=$(jq -r --arg t "$RS_TAG_INBOUND" \
+  '[.inbounds[] | select(.tag==$t)][0].streamSettings.realitySettings.shortIds[0] // ""' \
+  "$XRAY_CONFIG")
+[ "$EFFECTIVE_SID" = null ] && EFFECTIVE_SID=""
+
+LINK="vless://$UUID@$SERVER_IP:$XRAY_PORT?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&pbk=$PUBLIC_KEY&fp=chrome&sni=$SERVER_IP&sid=$EFFECTIVE_SID&spx=#$TAG"
 
 umask 077
 printf '%s\n' "$LINK" > "$OUT_DIR/link.txt"
 jq -n --arg s "$SERVER_IP" --argjson p "$XRAY_PORT" --arg u "$UUID" --arg k "$PUBLIC_KEY" \
+     --arg sid "$EFFECTIVE_SID" \
   '{ server: $s, server_port: $p, uuid: $u, flow: "xtls-rprx-vision",
-     public_key: $k, short_id: "", server_name: $s, fingerprint: "chrome" }' \
+     public_key: $k, short_id: $sid, server_name: $s, fingerprint: "chrome" }' \
   > "$OUT_DIR/client.json"
 
 echo
