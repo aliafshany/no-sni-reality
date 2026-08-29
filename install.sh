@@ -313,8 +313,39 @@ else
 fi
 
 [ -s "$CERT_DIR/fullchain.pem" ] || die "certificate file is empty"
+
+# acme.sh renews using the webroot it recorded at issue time. If that directory
+# is not the one nginx serves any more — an earlier hand-built setup, a moved
+# docroot — renewal fails the http-01 challenge and the certificate quietly dies
+# 160 hours later. Repoint it.
+ACME_DOMAIN_CONF="/root/.acme.sh/${SERVER_IP}_ecc/${SERVER_IP}.conf"
+if [ -f "$ACME_DOMAIN_CONF" ]; then
+  STORED_WEBROOT=$(sed -n "s/^Le_Webroot='\(.*\)'\$/\1/p" "$ACME_DOMAIN_CONF" | head -1)
+  if [ -n "$STORED_WEBROOT" ] && [ "$STORED_WEBROOT" != "$WEBROOT" ]; then
+    warn "renewal pointed at $STORED_WEBROOT, which is not what nginx serves; repointing to $WEBROOT"
+    sed -i "s#^Le_Webroot='.*'#Le_Webroot='$WEBROOT'#" "$ACME_DOMAIN_CONF"
+  fi
+fi
+
 CRONTAB_NOW=$(crontab -l 2>/dev/null || true)
 grep -q 'acme.sh --cron' <<<"$CRONTAB_NOW" || "$ACME" --install-cronjob >/dev/null 2>&1 || true
+CRONTAB_NOW=$(crontab -l 2>/dev/null || true)
+grep -q 'acme.sh --cron' <<<"$CRONTAB_NOW" \
+  || warn "no acme.sh cron entry — this certificate will not renew itself"
+
+# Prove the challenge directory is actually reachable, rather than assuming it.
+# This is the single thing that makes or breaks renewal, and it is silent when
+# it breaks.
+CANARY=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+mkdir -p "$WEBROOT/.well-known/acme-challenge"
+printf '%s' "$CANARY" > "$WEBROOT/.well-known/acme-challenge/$CANARY"
+if [ "$(curl -fsS -m 10 "http://$SERVER_IP/.well-known/acme-challenge/$CANARY" 2>/dev/null)" = "$CANARY" ]; then
+  say "renewal path verified: the ACME challenge directory answers over HTTP"
+else
+  warn "the ACME challenge directory is NOT reachable at http://$SERVER_IP/.well-known/acme-challenge/
+     This certificate lives 160 hours and will not renew. Free TCP 80 and rerun."
+fi
+rm -f "$WEBROOT/.well-known/acme-challenge/$CANARY"
 
 # --------------------------------------------------------------- decoy site
 
@@ -421,11 +452,22 @@ trap 'rm -f "$TMP_CONFIG"' EXIT
 # file, so a box running other inbounds or custom routing keeps them.
 if [ -f "$XRAY_CONFIG" ] && jq -e . "$XRAY_CONFIG" >/dev/null 2>&1; then
   cp -a "$XRAY_CONFIG" "$XRAY_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-  jq --argjson nb "$INBOUND" --arg t "$RS_TAG_INBOUND" '
+  # On a rerun, anything the operator tuned on this inbound by hand — a real
+  # shortId, minClientVer, fallback limits, sniffing options — must survive.
+  # jq's '*' merges recursively with the right side winning, so the existing
+  # inbound wins field by field; only the invariants this installer owns are
+  # then forced back into place.
+  jq --argjson nb "$INBOUND" --arg t "$RS_TAG_INBOUND" --arg dest "127.0.0.1:$FALLBACK_PORT" '
         .log = (.log // { loglevel: "warning" })
       | .inbounds = (
           if ((.inbounds // []) | any(.tag == $t))
-          then (.inbounds | map(if .tag == $t then $nb else . end))
+          then (.inbounds | map(
+                  if .tag == $t
+                  then ($nb * .)
+                       | .streamSettings.security = "reality"
+                       | .streamSettings.realitySettings.serverNames = [""]
+                       | .streamSettings.realitySettings.dest = $dest
+                  else . end))
           else ((.inbounds // []) + [$nb])
           end)
       | .outbounds = (if ((.outbounds // []) | length) > 0
